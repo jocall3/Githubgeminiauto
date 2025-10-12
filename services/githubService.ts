@@ -142,6 +142,7 @@ export async function createRepo({ token, name, description, isPrivate }: Create
     description,
     private: isPrivate,
     auto_init: true, // Auto-initialize with a README to avoid empty repo issues
+    gitignore_template: "Node", // Add a default gitignore.
   };
   return githubFetch<GithubRepo>('/user/repos', token, {
     method: 'POST',

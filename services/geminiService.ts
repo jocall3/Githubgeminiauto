@@ -1,4 +1,5 @@
-import { GoogleGenAI, GenerateContentResponse, Type } from "@google/genai";
+
+import { GoogleGenAI, GenerateContentResponse, Type, FunctionDeclaration, Chat } from "@google/genai";
 import { ProjectPlan } from '../types';
 
 // This is a browser-based app, so `process.env.API_KEY` is expected to be
@@ -20,74 +21,86 @@ function getAiClient(): GoogleGenAI {
     return ai;
 }
 
-async function generateCodeEditStream(prompt: string, onChunk: (chunk: string) => void): Promise<void> {
-    try {
-        const client = getAiClient();
-        const responseStream = await client.models.generateContentStream({
-            model: 'gemini-2.5-flash',
-            contents: prompt,
-        });
+export const codeAgentTools: FunctionDeclaration[] = [
+    {
+        name: 'readFile',
+        parameters: {
+            type: Type.OBJECT,
+            description: 'Reads the content of a file from the repository.',
+            properties: {
+                filePath: {
+                    type: Type.STRING,
+                    description: 'The full path of the file to read, relative to the repository root.',
+                },
+            },
+            required: ['filePath'],
+        },
+    },
+    {
+        name: 'createFile',
+        parameters: {
+            type: Type.OBJECT,
+            description: 'Creates a new file in the repository with the given content. The file path should be a full path from the repository root. Directories will be created if they do not exist.',
+            properties: {
+                filePath: {
+                    type: Type.STRING,
+                    description: 'The full path for the new file.',
+                },
+                content: {
+                    type: Type.STRING,
+                    description: 'The content of the new file.',
+                },
+            },
+            required: ['filePath', 'content'],
+        },
+    },
+    {
+        name: 'updateFile',
+        parameters: {
+            type: Type.OBJECT,
+            description: 'Updates the content of an existing file.',
+            properties: {
+                filePath: {
+                    type: Type.STRING,
+                    description: 'The full path of the file to update.',
+                },
+                newContent: {
+                    type: Type.STRING,
+                    description: 'The new, complete content for the file.',
+                },
+            },
+            required: ['filePath', 'newContent'],
+        },
+    },
+];
 
-        for await (const chunk of responseStream) {
-            const text = chunk.text;
-            if (text) {
-                onChunk(text);
-            }
-        }
-    } catch (error) {
-        console.error("Error calling Gemini API:", error);
-        if (error instanceof Error) {
-            // Propagate a more informative error message.
-            throw new Error(`AI request failed: ${error.message}`);
-        }
-        throw new Error("Failed to get response from AI due to an unknown error.");
-    }
-}
 
+export function createCodeAgentChat(): Chat {
+    const client = getAiClient();
+    const systemInstruction = `
+You are an expert AI code assistant with agentic capabilities. Your goal is to help the user with their coding tasks by modifying the repository's files.
 
-export async function editFileWithAI(currentCode: string, instruction: string, onChunk: (chunk: string) => void): Promise<void> {
-  const prompt = `
-You are an expert code assistant. Your task is to modify the provided code based on the user's instruction.
-You MUST return only the complete, updated code block. Do not add any explanations, introductory text, or markdown code fences like \`\`\`.
+You have been provided with a set of tools to interact with the file system: \`readFile\`, \`createFile\`, and \`updateFile\`.
 
-Instruction:
-${instruction}
-
----
-
-Original Code:
-${currentCode}
-
----
-
-Updated Code:
+**Workflow:**
+1.  **Analyze the Request:** Carefully read the user's instruction, the currently open file's content, and the repository's file tree.
+2.  **Plan:** Formulate a plan to fulfill the request. You may need to read other files for context before making changes.
+3.  **Execute:** Use the provided tools to execute your plan.
+    - Use \`readFile\` to understand existing code in other files.
+    - Use \`updateFile\` to modify an existing file.
+    - Use \`createFile\` to add new files.
+4.  **Feature Expansion Mandate:** After you have successfully completed the user's primary request, you MUST enter a "Feature Expansion" phase. In this phase, you are required to brainstorm and create exactly 5 new files, each containing a new, fully coded feature that is relevant to the original request. Use the \`createFile\` tool for each new feature. Announce that you are starting this phase before you begin.
+5.  **Respond:** Once you have completed all file operations, including the 5 mandatory new feature files, respond with a concise summary of all the changes you made. Do not respond with a summary until you are completely finished.
 `;
-  await generateCodeEditStream(prompt, onChunk);
-}
 
-export async function bulkEditFileWithAI(currentCode: string, instruction: string, filePath: string, onChunk: (chunk: string) => void): Promise<void> {
-    const prompt = `
-You are an expert AI programmer executing a high-level directive across an entire codebase.
-For the file located at \`${filePath}\`, apply the following overall instruction:
-"${instruction}"
-
-Your task is to significantly enhance and expand this specific file based on the instruction.
-- Add new features, classes, and functions that are relevant to the file's purpose and the main instruction. The goal is to substantially increase the file's value and content.
-- You MUST NOT change or remove any existing import statements.
-- Any new top-level functions, classes, or variables you create MUST be exported.
-- Your changes should be mindful of the entire repository's architecture. Create code that can intelligently interact with other modules.
-- Adhere strictly to the coding style and language of the original file.
-
-Return ONLY the complete, updated code for the file. Do not include any explanations, markdown fences, or other text outside of the code itself.
-
----
-Original Code from \`${filePath}\`:
-${currentCode}
----
-
-Updated Code:
-`;
-    await generateCodeEditStream(prompt, onChunk);
+    const chat = client.chats.create({
+        model: 'gemini-2.5-flash',
+        config: {
+            systemInstruction,
+            tools: [{ functionDeclarations: codeAgentTools }],
+        }
+    });
+    return chat;
 }
 
 export async function generateProjectPlan(userPrompt: string): Promise<ProjectPlan> {
@@ -140,6 +153,45 @@ User Request:
     }
 }
 
+async function generateStream(prompt: string, onChunk: (chunk: string) => void): Promise<void> {
+    try {
+        const client = getAiClient();
+        const responseStream = await client.models.generateContentStream({
+            model: 'gemini-2.5-flash',
+            contents: prompt,
+        });
+
+        for await (const chunk of responseStream) {
+            const text = chunk.text;
+            if (text) {
+                onChunk(text);
+            }
+        }
+    } catch (error) {
+        console.error("Error calling Gemini API:", error);
+        if (error instanceof Error) {
+            throw new Error(`AI request failed: ${error.message}`);
+        }
+        throw new Error("Failed to get response from AI due to an unknown error.");
+    }
+}
+
+export async function generateBulkEdit(instruction: string, filePath: string, fileContent: string, onChunk: (chunk: string) => void): Promise<void> {
+    const prompt = `
+You are an expert AI programmer. Your high-level task is: "${instruction}".
+You are currently editing the file at path \`${filePath}\`.
+Its current content is:
+---
+${fileContent}
+---
+
+Based on the high-level task, please generate the new, complete content for this specific file.
+Return ONLY the complete code for the file. Do not include any explanations, markdown fences, or other text outside of the code itself.
+`;
+    await generateStream(prompt, onChunk);
+}
+
+
 export async function generateFileContent(projectGoal: string, filePath: string, fileDescription: string, onChunk: (chunk: string) => void): Promise<void> {
     const prompt = `
 You are an expert AI programmer. You are building a new project based on the overall goal: "${projectGoal}".
@@ -154,5 +206,5 @@ If you are generating a package.json, ensure it contains valid JSON.
 ---
 Generated Code for \`${filePath}\`:
 `;
-    await generateCodeEditStream(prompt, onChunk);
+    await generateStream(prompt, onChunk);
 }

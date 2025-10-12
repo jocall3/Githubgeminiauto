@@ -1,3 +1,5 @@
+
+
 export interface GithubRepo {
   id: number;
   name: string;
@@ -80,17 +82,6 @@ export interface PullRequest {
   state: 'open' | 'closed';
 }
 
-export type BulkEditJobStatus = 'queued' | 'processing' | 'success' | 'skipped' | 'failed';
-
-export interface BulkEditJob {
-  id: string; // repoFullName::path
-  repoFullName: string;
-  path: string;
-  status: BulkEditJobStatus;
-  content: string; // For streaming preview
-  error: string | null;
-}
-
 export interface ProjectPlan {
     files: {
         path: string;
@@ -107,4 +98,32 @@ export interface ProjectGenerationJob {
   status: ProjectGenerationJobStatus;
   content: string; // For streaming preview
   error: string | null;
+}
+
+export type BulkEditJobStatus = 'queued' | 'processing' | 'success' | 'skipped' | 'failed';
+
+export interface BulkEditJob {
+  id: string; // repoFullName::path
+  path: string; // repoFullName::path
+  status: BulkEditJobStatus;
+  content: string;
+  error: string | null;
+}
+
+export interface DriveFile {
+  name: string;
+  content: string;
+}
+
+export type AiAgentStatus = 'idle' | 'running' | 'complete' | 'error';
+
+export interface AiAgentLog {
+  type: 'info' | 'tool-call' | 'tool-result' | 'model-response' | 'error';
+  message: string;
+  data?: any;
+}
+
+export interface AiAgentState {
+  status: AiAgentStatus;
+  logs: AiAgentLog[];
 }

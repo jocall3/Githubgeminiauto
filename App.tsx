@@ -1,17 +1,23 @@
 
+
 import React, { useState, useCallback, useEffect, useRef } from 'react';
 import { AuthModal } from './components/AuthModal';
 import { FileExplorer } from './components/FileExplorer';
 import { EditorCanvas } from './components/EditorCanvas';
 import { fetchAllRepos, fetchRepoTree, getFileContent, commitFile, getRepoBranches, createBranch, createPullRequest, createRepo } from './services/githubService';
-import { editFileWithAI, bulkEditFileWithAI, generateProjectPlan, generateFileContent } from './services/geminiService';
-import { GithubRepo, UnifiedFileTree, SelectedFile, Alert, Branch, FileNode, DirNode, BulkEditJob, ProjectGenerationJob, ProjectPlan } from './types';
+import { generateProjectPlan, generateFileContent, createCodeAgentChat, generateBulkEdit } from './services/geminiService';
+import { pickAndDownloadFile } from './services/googleDriveService';
+import { GithubRepo, UnifiedFileTree, SelectedFile, Alert, Branch, FileNode, DirNode, ProjectGenerationJob, ProjectPlan, DriveFile, AiAgentState, AiAgentLog, BulkEditJob } from './types';
 import { Spinner } from './components/Spinner';
 import { AlertPopup } from './components/AlertPopup';
-import { MultiFileAiEditModal } from './components/BulkAiEditModal';
-import { BulkEditProgress } from './components/BulkEditProgress';
 import { NewProjectModal } from './components/NewProjectModal';
 import { ProjectGenerationProgress } from './components/ProjectGenerationProgress';
+import { CommitDriveFileModal } from './components/CommitDriveFileModal';
+import { AiAgentModal } from './components/AiAgentModal';
+import { Chat } from '@google/genai';
+import { MultiFileAiEditModal } from './components/BulkAiEditModal';
+import { BulkEditProgress } from './components/BulkEditProgress';
+
 
 export const getAllFilePaths = (nodes: (DirNode | FileNode)[]): string[] => {
     let paths: string[] = [];
@@ -40,16 +46,21 @@ export default function App() {
   const [branchesByRepo, setBranchesByRepo] = useState<Record<string, Branch[]>>({});
   const [currentBranchByRepo, setCurrentBranchByRepo] = useState<Record<string, string>>({});
 
-  const [isMultiEditModalOpen, setMultiEditModalOpen] = useState(false);
-  const [selectedFiles, setSelectedFiles] = useState<Set<string>>(new Set());
-
-  const [isBulkEditing, setIsBulkEditing] = useState(false);
-  const [bulkEditJobs, setBulkEditJobs] = useState<BulkEditJob[]>([]);
-  
   const [isNewProjectModalOpen, setNewProjectModalOpen] = useState(false);
   const [isGeneratingProject, setIsGeneratingProject] = useState(false);
   const [projectGenerationJobs, setProjectGenerationJobs] = useState<ProjectGenerationJob[]>([]);
   const [projectGenerationStatus, setProjectGenerationStatus] = useState('');
+  
+  const [driveFileToCommit, setDriveFileToCommit] = useState<DriveFile | null>(null);
+
+  const [isAiAgentModalOpen, setAiAgentModalOpen] = useState(false);
+  const [aiAgentState, setAiAgentState] = useState<AiAgentState>({ status: 'idle', logs: [] });
+  const agentChatRef = useRef<Chat | null>(null);
+
+  const [selectedFilePaths, setSelectedFilePaths] = useState(new Set<string>());
+  const [isBulkEditModalOpen, setBulkEditModalOpen] = useState(false);
+  const [isBulkProgressModalOpen, setBulkProgressModalOpen] = useState(false);
+  const [bulkEditJobs, setBulkEditJobs] = useState<BulkEditJob[]>([]);
 
 
   const activeFile = openFiles.find(f => (f.repoFullName + '::' + f.path) === activeFileKey);
@@ -68,11 +79,14 @@ export default function App() {
       const repoPromises = repos.map(async (repo) => {
         setLoadingMessage(`Processing ${repo.owner.login}/${repo.name}...`);
         try {
-          newFileTree[repo.full_name] = { repo, tree: [] };
           const tree = await fetchRepoTree(submittedToken, repo.owner.login, repo.name, repo.default_branch);
-          newFileTree[repo.full_name].tree = tree;
+          newFileTree[repo.full_name] = { repo, tree };
         } catch (error) {
           console.error(`Failed to fetch tree for ${repo.full_name}`, error);
+          if (error instanceof Error && error.message.includes('409')) {
+             showAlert('error', `Repository ${repo.full_name} is empty.`);
+             newFileTree[repo.full_name] = { repo, tree: [] };
+          }
         }
       });
 
@@ -168,22 +182,148 @@ export default function App() {
       (file.repoFullName + '::' + file.path) === key ? { ...file, editedContent: newContent } : file
     ));
   }, []);
+  
+  const addAgentLog = (log: AiAgentLog) => {
+    setAiAgentState(prev => ({...prev, logs: [...prev.logs, log]}));
+  };
+  
+  const runAiAgent = async (instruction: string) => {
+    if (!activeFile || !token) return;
 
-  const handleAiEdit = useCallback(async (currentCode: string, instruction: string, onChunk: (chunk: string) => void): Promise<void> => {
-    setIsLoading(true);
-    setLoadingMessage('AI is editing the code...');
-    try {
-      await editFileWithAI(currentCode, instruction, onChunk);
-      showAlert('success', 'AI edit complete.');
-    } catch (error) {
-        console.error("AI Edit Error:", error);
-        const errorMessage = typeof error === 'string' ? error : (error instanceof Error ? error.message : 'An unknown AI error occurred.');
-        showAlert('error', `AI Error: ${errorMessage}`);
-    } finally {
-      setIsLoading(false);
-      setLoadingMessage('');
+    setAiAgentState({ status: 'running', logs: [{ type: 'info', message: 'Starting AI agent...' }] });
+    
+    agentChatRef.current = createCodeAgentChat();
+    const chat = agentChatRef.current;
+    
+    const [owner, repoName] = activeFile.repoFullName.split('/');
+
+    const serializeTree = (nodes: (DirNode | FileNode)[], prefix = ''): string => {
+        let result = '';
+        for (const node of nodes) {
+            result += `${prefix}${node.name}${node.type === 'dir' ? '/' : ''}\n`;
+            if (node.type === 'dir') {
+                result += serializeTree(node.children, prefix + '  ');
+            }
+        }
+        return result;
+    };
+    
+    const fileTreeString = serializeTree(fileTree[activeFile.repoFullName].tree);
+    
+    const initialPrompt = `
+User Instruction: "${instruction}"
+
+Current open file: \`${activeFile.path}\`
+
+Content of \`${activeFile.path}\`:
+---
+${activeFile.editedContent}
+---
+
+Full repository file tree:
+---
+${fileTreeString}
+---
+Now, please analyze the request and begin executing the plan.
+`;
+
+    addAgentLog({ type: 'info', message: 'Sending initial prompt to AI...' });
+    let response = await chat.sendMessage({ message: initialPrompt });
+
+    while (true) {
+        const functionCalls = response.functionCalls;
+        if (functionCalls && functionCalls.length > 0) {
+            addAgentLog({ type: 'tool-call', message: `Model wants to call: ${functionCalls.map(c => c.name).join(', ')}`, data: functionCalls });
+
+            const functionResponseParts = [];
+
+            for (const call of functionCalls) {
+                let result: any;
+                let error: string | null = null;
+                const activeBranch = currentBranchByRepo[activeFile.repoFullName];
+
+                try {
+                    switch (call.name) {
+                        case 'readFile': {
+                            const { filePath } = call.args;
+                            addAgentLog({ type: 'info', message: `Reading file: ${filePath}` });
+                            const fileData = await getFileContent(token, owner, repoName, filePath, activeBranch);
+                            result = fileData.content;
+                            break;
+                        }
+                        case 'updateFile': {
+                            const { filePath, newContent } = call.args;
+                            addAgentLog({ type: 'info', message: `Updating file: ${filePath}` });
+                            const fileToUpdate = await getFileContent(token, owner, repoName, filePath, activeBranch);
+                            await commitFile({
+                                token, owner, repo: repoName, branch: activeBranch,
+                                path: filePath, content: newContent, message: `[AI] Update ${filePath}`, sha: fileToUpdate.sha,
+                            });
+                            result = `Successfully updated ${filePath}.`;
+                            const openFileKey = `${activeFile.repoFullName}::${filePath}`;
+                            if (openFiles.some(f => (f.repoFullName + '::' + f.path) === openFileKey)) {
+                               const updatedFile = await getFileContent(token, owner, repoName, filePath, activeBranch);
+                                setOpenFiles(prev => prev.map(f => (f.repoFullName + '::' + f.path) === openFileKey ? { ...f, content: updatedFile.content, editedContent: updatedFile.content, sha: updatedFile.sha } : f));
+                            }
+                            break;
+                        }
+                        case 'createFile': {
+                            const { filePath, content } = call.args;
+                             addAgentLog({ type: 'info', message: `Creating new file: ${filePath}` });
+                             await commitFile({
+                                token, owner, repo: repoName, branch: activeBranch,
+                                path: filePath, content, message: `[AI] Create ${filePath}`,
+                            });
+                            result = `Successfully created ${filePath}.`;
+                            break;
+                        }
+                        default:
+                          error = `Unknown tool: ${call.name}`;
+                    }
+                } catch(e) {
+                    error = (e instanceof Error) ? e.message : 'An unknown error occurred during tool execution.';
+                }
+
+                if (error) {
+                    addAgentLog({ type: 'error', message: `Error executing tool ${call.name}: ${error}` });
+                    functionResponseParts.push({ functionResponse: { name: call.name, response: { error } } });
+                } else {
+                    addAgentLog({ type: 'tool-result', message: `Result for ${call.name}`, data: result });
+                    functionResponseParts.push({ functionResponse: { name: call.name, response: { result } } });
+                }
+            }
+            
+            if (functionResponseParts.length > 0) {
+                response = await chat.sendMessage({ parts: functionResponseParts });
+            } else {
+                addAgentLog({ type: 'info', message: 'Model returned no tool calls to respond to. Ending agent run.' });
+                break;
+            }
+        } else {
+            addAgentLog({ type: 'model-response', message: 'AI has finished.', data: response.text });
+            setAiAgentState(prev => ({...prev, status: 'complete'}));
+            
+            addAgentLog({ type: 'info', message: 'Refreshing file explorer...'});
+            const tree = await fetchRepoTree(token, owner, repoName, currentBranchByRepo[activeFile.repoFullName]);
+            setFileTree(prev => ({
+                ...prev,
+                [activeFile.repoFullName]: { ...prev[activeFile.repoFullName], tree }
+            }));
+
+            break; 
+        }
     }
-  }, []);
+  };
+  
+  const handleAiAgentSubmit = async (instruction: string) => {
+    if (!instruction.trim() || !activeFile) return;
+    setAiAgentModalOpen(true);
+    runAiAgent(instruction).catch(err => {
+        console.error("AI Agent failed:", err);
+        addAgentLog({ type: 'error', message: `Agent failed: ${(err as Error).message}` });
+        setAiAgentState(prev => ({...prev, status: 'error'}));
+    });
+  };
 
   const handleCommit = useCallback(async (commitMessage: string) => {
     if (!token || !activeFile || !currentBranch) return;
@@ -223,12 +363,10 @@ export default function App() {
 
   const handleBranchChange = useCallback((newBranch: string) => {
     if (activeFile) {
-        // Reload all open files from that repo on the new branch
         const repoToUpdate = activeFile.repoFullName;
         setCurrentBranchByRepo(prev => ({...prev, [repoToUpdate]: newBranch}));
         
         const filesToReload = openFiles.filter(f => f.repoFullName === repoToUpdate);
-        // We close them first, then re-open. A bit blunt, but effective.
         const otherFiles = openFiles.filter(f => f.repoFullName !== repoToUpdate);
         setOpenFiles(otherFiles);
         setActiveFileKey(otherFiles[0] ? (otherFiles[0].repoFullName + '::' + otherFiles[0].path) : null);
@@ -293,131 +431,6 @@ export default function App() {
     }
   }, [token, activeFile, currentBranch]);
 
- const handleFileSelection = useCallback((fileKey: string, isSelected: boolean) => {
-    setSelectedFiles(prev => {
-      const newSet = new Set(prev);
-      if (isSelected) {
-        newSet.add(fileKey);
-      } else {
-        newSet.delete(fileKey);
-      }
-      return newSet;
-    });
-  }, []);
-
-  const handleDirectorySelection = useCallback((nodes: (DirNode | FileNode)[], repoFullName: string, shouldSelect: boolean) => {
-    const allPaths = getAllFilePaths(nodes);
-    setSelectedFiles(prev => {
-        const newSet = new Set(prev);
-        for (const path of allPaths) {
-            const key = `${repoFullName}::${path}`;
-            if (shouldSelect) {
-                newSet.add(key);
-            } else {
-                newSet.delete(key);
-            }
-        }
-        return newSet;
-    });
-  }, []);
-
-  const handleMultiFileEditSubmit = useCallback(async (instruction: string) => {
-    if (!token || selectedFiles.size === 0) return;
-    
-    setMultiEditModalOpen(false);
-    
-    // FIX: Use spread syntax to convert Set to Array. This ensures `paths` is
-    // correctly typed as `string[]` and resolves downstream type errors.
-    const paths = [...selectedFiles];
-    const initialJobs: BulkEditJob[] = paths.map(fullPath => {
-        const [repoFullName, path] = fullPath.split('::');
-        return {
-            id: fullPath,
-            repoFullName,
-            path,
-            status: 'queued',
-            content: '',
-            error: null,
-        };
-    });
-    setBulkEditJobs(initialJobs);
-    setIsBulkEditing(true);
-    setSelectedFiles(new Set());
-
-    const processFile = async (jobId: string) => {
-        setBulkEditJobs(prev => prev.map(j => j.id === jobId ? { ...j, status: 'processing' } : j));
-        
-        const job = initialJobs.find(j => j.id === jobId);
-        if (!job || !token) return;
-
-        const { repoFullName, path } = job;
-        const [owner, repo] = repoFullName.split('/');
-        const repoData = fileTree[repoFullName]?.repo;
-        if (!repoData) {
-            setBulkEditJobs(prev => prev.map(j => j.id === jobId ? { ...j, status: 'failed', error: 'Repo data not found' } : j));
-            return;
-        }
-
-        try {
-            const branch = currentBranchByRepo[repoFullName] || repoData.default_branch;
-            const fileContent = await getFileContent(token, owner, repo, path, branch);
-
-            let newContent = '';
-            const handleChunk = (chunk: string) => {
-                newContent += chunk;
-                setBulkEditJobs(prev => prev.map(j => j.id === jobId ? { ...j, content: newContent } : j));
-            };
-
-            await bulkEditFileWithAI(fileContent.content, instruction, path, handleChunk);
-            
-            if (newContent.trim() === fileContent.content.trim() || newContent.trim() === '') {
-                setBulkEditJobs(prev => prev.map(j => j.id === jobId ? { ...j, status: 'skipped' } : j));
-                return;
-            }
-            
-            await commitFile({
-                token, owner, repo, branch, path, content: newContent,
-                message: `[AI] Edit: ${path}`,
-                sha: fileContent.sha,
-            });
-            
-            setBulkEditJobs(prev => prev.map(j => j.id === jobId ? { ...j, status: 'success' } : j));
-
-            const committedFileKey = `${repoFullName}::${path}`;
-            const isOpen = openFiles.some(f => (f.repoFullName + '::' + f.path) === committedFileKey);
-            if (isOpen) {
-                const updatedFile = await getFileContent(token, owner, repo, path, branch);
-                 setOpenFiles(prev => prev.map(f => 
-                    (f.repoFullName + '::' + f.path) === committedFileKey 
-                    ? { ...f, content: updatedFile.content, editedContent: updatedFile.content, sha: updatedFile.sha } 
-                    : f
-                ));
-            }
-        } catch (err) {
-             const errorMessage = (err instanceof Error) ? err.message : 'An unknown error occurred.';
-             setBulkEditJobs(prev => prev.map(j => j.id === jobId ? { ...j, status: 'failed', error: errorMessage } : j));
-        }
-    };
-
-    const CONCURRENCY_LIMIT = 5;
-    const taskQueue = [...initialJobs];
-
-    const worker = async () => {
-        while (taskQueue.length > 0) {
-            const job = taskQueue.shift();
-            if (job) {
-                await processFile(job.id);
-            }
-        }
-    };
-
-    const workers = Array(CONCURRENCY_LIMIT).fill(null).map(worker);
-    await Promise.all(workers);
-
-    showAlert('success', 'Multi-file edit process completed.');
-    
-  }, [token, selectedFiles, fileTree, currentBranchByRepo, openFiles]);
-
     const addRepoToFileTree = useCallback(async (repo: GithubRepo) => {
         if (!token) return;
         try {
@@ -441,15 +454,46 @@ export default function App() {
         
         let newRepo: GithubRepo | null = null;
         try {
-            // 1. Create Repo
-            setProjectGenerationStatus(`Creating repository '${repoName}'...`);
-            newRepo = await createRepo({ token, name: repoName, description: prompt, isPrivate });
+            // Robust repository creation with retry logic
+            let repoToCreateName = repoName;
+            let created = false;
+            let attempts = 0;
+            const maxAttempts = 5;
+
+            while (!created && attempts < maxAttempts) {
+                try {
+                    setProjectGenerationStatus(`Attempting to create repository '${repoToCreateName}'...`);
+                    newRepo = await createRepo({ token, name: repoToCreateName, description: prompt, isPrivate });
+                    created = true;
+                } catch (error) {
+                    if (error instanceof Error && error.message.includes('422')) { // 422 indicates a name conflict
+                        attempts++;
+                        const suffix = Math.floor(100 + Math.random() * 900); // 3-digit random number
+                        repoToCreateName = `${repoName.replace(/-\d+$/, '')}-${suffix}`;
+                        setProjectGenerationStatus(`Repository name exists. Retrying with '${repoToCreateName}'...`);
+                        await new Promise(resolve => setTimeout(resolve, 1000)); // Wait 1s before retrying
+                    } else {
+                        throw error; // Re-throw other errors
+                    }
+                }
+            }
+
+            if (!newRepo) {
+                throw new Error(`Failed to create repository '${repoName}' after ${maxAttempts} attempts. The name may be taken.`);
+            }
+
             showAlert('success', `Repository '${newRepo.full_name}' created.`);
 
-            // 2. Plan Project
             setProjectGenerationStatus(`Asking AI to plan project structure...`);
             const plan: ProjectPlan = await generateProjectPlan(prompt);
-            const initialJobs: ProjectGenerationJob[] = plan.files.map(file => ({
+            
+            // Filter out files that are auto-generated by GitHub to prevent conflicts.
+            const filesToGenerate = plan.files.filter(file => {
+                const lowerCasePath = file.path.toLowerCase().trim();
+                return lowerCasePath !== 'readme.md' && lowerCasePath !== '.gitignore';
+            });
+
+            const initialJobs: ProjectGenerationJob[] = filesToGenerate.map(file => ({
                 id: file.path,
                 path: file.path,
                 description: file.description,
@@ -459,13 +503,11 @@ export default function App() {
             }));
             setProjectGenerationJobs(initialJobs);
 
-            // 3. Generate and Commit Files
             setProjectGenerationStatus(`Generating ${initialJobs.length} files...`);
             const processFile = async (jobId: string) => {
                 const job = initialJobs.find(j => j.id === jobId);
                 if (!job || !token || !newRepo) return;
 
-                // Generate
                 setProjectGenerationJobs(prev => prev.map(j => j.id === jobId ? { ...j, status: 'generating' } : j));
                 let newContent = '';
                 const handleChunk = (chunk: string) => {
@@ -474,7 +516,6 @@ export default function App() {
                 };
                 await generateFileContent(prompt, job.path, job.description, handleChunk);
                 
-                // Commit
                 setProjectGenerationJobs(prev => prev.map(j => j.id === jobId ? { ...j, status: 'committing' } : j));
                 await commitFile({
                     token,
@@ -506,7 +547,6 @@ export default function App() {
             };
             await Promise.all(Array(CONCURRENCY_LIMIT).fill(null).map(worker));
             
-            // 4. Refresh UI
             setProjectGenerationStatus(`Finalizing...`);
             await addRepoToFileTree(newRepo);
             showAlert('success', `Project '${newRepo.full_name}' generated successfully!`);
@@ -514,11 +554,125 @@ export default function App() {
         } catch (err) {
             const errorMessage = (err instanceof Error) ? err.message : 'An unknown error occurred.';
             showAlert('error', `Project generation failed: ${errorMessage}`);
-            // Don't close the progress modal on failure, so user can see errors
-            return; 
+            setIsGeneratingProject(false); // Ensure progress UI is hidden on failure
         }
         
     }, [token, addRepoToFileTree]);
+
+    const handleImportFromDrive = useCallback(async () => {
+        setIsLoading(true);
+        setLoadingMessage('Opening Google Drive...');
+        try {
+            const file = await pickAndDownloadFile();
+            setDriveFileToCommit(file);
+        } catch (error) {
+            console.error(error);
+            showAlert('error', `Failed to import from Google Drive: ${(error as Error).message}`);
+        } finally {
+            setIsLoading(false);
+            setLoadingMessage('');
+        }
+    }, []);
+
+    const handleCommitDriveFile = useCallback(async (repoFullName: string, branch: string, path: string, message: string) => {
+        if (!token || !driveFileToCommit) return;
+        setIsLoading(true);
+        setLoadingMessage('Committing file from Google Drive...');
+        try {
+            const [owner, repoName] = repoFullName.split('/');
+            await commitFile({
+                token,
+                owner,
+                repo: repoName,
+                branch,
+                path,
+                content: driveFileToCommit.content,
+                message,
+                sha: undefined,
+            });
+            showAlert('success', `File '${path}' committed successfully to ${repoFullName}.`);
+            setDriveFileToCommit(null);
+            
+            const tree = await fetchRepoTree(token, owner, repoName, branch);
+            setFileTree(prev => ({
+                ...prev,
+                [repoFullName]: { ...prev[repoFullName], tree }
+            }));
+            
+        } catch (error) {
+            console.error(error);
+            showAlert('error', `Failed to commit file: ${(error as Error).message}`);
+        } finally {
+            setIsLoading(false);
+            setLoadingMessage('');
+        }
+    }, [token, driveFileToCommit]);
+
+    const handleBulkAiSubmit = useCallback(async (instruction: string) => {
+        if (!token || selectedFilePaths.size === 0) return;
+
+        setBulkEditModalOpen(false);
+        
+        // FIX: Explicitly type `fullPath` as `string` to resolve TypeScript inference issue.
+        const initialJobs: BulkEditJob[] = Array.from(selectedFilePaths).map((fullPath: string) => ({
+            id: fullPath,
+            path: fullPath,
+            status: 'queued',
+            content: '',
+            error: null,
+        }));
+        setBulkEditJobs(initialJobs);
+        setBulkProgressModalOpen(true);
+
+        const processJob = async (jobId: string) => {
+            const [repoFullName, path] = jobId.split('::');
+            const [owner, repoName] = repoFullName.split('/');
+            const branch = currentBranchByRepo[repoFullName] || fileTree[repoFullName].repo.default_branch;
+            if (!branch) {
+                 setBulkEditJobs(prev => prev.map(j => j.id === jobId ? { ...j, status: 'failed', error: 'Could not determine branch.' } : j));
+                 return;
+            }
+
+            try {
+                setBulkEditJobs(prev => prev.map(j => j.id === jobId ? { ...j, status: 'processing' } : j));
+
+                const originalFile = await getFileContent(token, owner, repoName, path, branch);
+                
+                let newContent = '';
+                const handleChunk = (chunk: string) => {
+                    newContent += chunk;
+                    setBulkEditJobs(prev => prev.map(j => j.id === jobId ? { ...j, content: newContent } : j));
+                };
+
+                await generateBulkEdit(instruction, path, originalFile.content, handleChunk);
+
+                await commitFile({
+                    token, owner, repo: repoName, branch, path,
+                    content: newContent,
+                    message: `[AI] Bulk edit: ${path}`,
+                    sha: originalFile.sha,
+                });
+
+                setBulkEditJobs(prev => prev.map(j => j.id === jobId ? { ...j, status: 'success' } : j));
+            } catch (err) {
+                 const errorMessage = (err instanceof Error) ? err.message : 'An unknown error occurred.';
+                 setBulkEditJobs(prev => prev.map(j => j.id === jobId ? { ...j, status: 'failed', error: errorMessage } : j));
+            }
+        };
+
+        const CONCURRENCY_LIMIT = 5;
+        const taskQueue = [...initialJobs];
+        const worker = async () => {
+            while(taskQueue.length > 0) {
+                const job = taskQueue.shift();
+                if (job) {
+                    await processJob(job.id);
+                }
+            }
+        };
+        await Promise.all(Array(CONCURRENCY_LIMIT).fill(null).map(worker));
+
+    }, [token, selectedFilePaths, currentBranchByRepo, fileTree]);
 
   return (
     <div className="flex h-screen font-sans">
@@ -530,13 +684,13 @@ export default function App() {
             <FileExplorer 
               fileTree={fileTree} 
               onFileSelect={handleOpenFile}
-              onStartMultiEdit={() => setMultiEditModalOpen(true)}
               onStartNewProject={() => setNewProjectModalOpen(true)}
+              onImportFromDrive={handleImportFromDrive}
               selectedRepo={activeFile?.repoFullName}
               selectedFilePath={activeFile?.path}
-              selectedFiles={selectedFiles}
-              onFileSelection={handleFileSelection}
-              onDirectorySelection={handleDirectorySelection}
+              selectedPaths={selectedFilePaths}
+              onSelectionChange={setSelectedFilePaths}
+              onStartBulkEdit={() => setBulkEditModalOpen(true)}
             />
           </aside>
           <main className="flex-grow h-full">
@@ -544,7 +698,10 @@ export default function App() {
               openFiles={openFiles}
               activeFile={activeFile || null}
               onCommit={handleCommit}
-              onAiEdit={handleAiEdit}
+              onAiEdit={() => {
+                  setAiAgentState({ status: 'idle', logs: [] });
+                  setAiAgentModalOpen(true);
+              }}
               onFileContentChange={handleFileContentChange}
               onCloseFile={handleCloseFile}
               onSetActiveFile={handleSetActiveFile}
@@ -559,7 +716,7 @@ export default function App() {
         </>
       )}
 
-      {isLoading && !isBulkEditing && (
+      {isLoading && (
         <div className="fixed top-5 left-1/2 -translate-x-1/2 bg-gray-800 text-white px-6 py-3 rounded-lg shadow-lg z-50 flex items-center gap-4 animate-fade-in-down">
           <style>{`
             @keyframes fade-in-down {
@@ -577,46 +734,69 @@ export default function App() {
             }
           `}</style>
           <Spinner />
-          <p>{loadingMessage}</p>
+          <span>{loadingMessage}</span>
         </div>
       )}
 
-      {alert && <AlertPopup alert={alert} onClose={() => setAlert(null)} />}
-      
+      <AlertPopup alert={alert} onClose={() => setAlert(null)} />
+
       {isNewProjectModalOpen && (
-        <NewProjectModal
-            onClose={() => setNewProjectModalOpen(false)}
-            onSubmit={handleGenerateProject}
-        />
-      )}
-
-      {isMultiEditModalOpen && (
-        <MultiFileAiEditModal
-          fileCount={selectedFiles.size}
-          onClose={() => setMultiEditModalOpen(false)}
-          onSubmit={handleMultiFileEditSubmit}
-        />
-      )}
-
-      {isBulkEditing && (
-        <BulkEditProgress 
-            jobs={bulkEditJobs}
-            onClose={() => setIsBulkEditing(false)}
-            isComplete={!bulkEditJobs.some(j => j.status === 'processing' || j.status === 'queued')}
-        />
+          <NewProjectModal
+              onClose={() => setNewProjectModalOpen(false)}
+              onSubmit={handleGenerateProject}
+          />
       )}
 
       {isGeneratingProject && (
-        <ProjectGenerationProgress
-            jobs={projectGenerationJobs}
+          <ProjectGenerationProgress 
+            jobs={projectGenerationJobs} 
             statusMessage={projectGenerationStatus}
+            isComplete={!projectGenerationJobs.some(j => j.status === 'queued' || j.status === 'generating' || j.status === 'committing')}
             onClose={() => setIsGeneratingProject(false)}
-            isComplete={
-              projectGenerationJobs.length > 0 &&
-              !projectGenerationJobs.some(j => j.status === 'generating' || j.status === 'queued' || j.status === 'committing')
-            }
-        />
+          />
       )}
+      
+      {driveFileToCommit && (
+          <CommitDriveFileModal
+            driveFile={driveFileToCommit}
+            fileTree={fileTree}
+            branchesByRepo={branchesByRepo}
+            onClose={() => setDriveFileToCommit(null)}
+            onSubmit={handleCommitDriveFile}
+            isLoading={isLoading}
+            onFetchBranches={async (repoFullName) => {
+                if (!token) return;
+                const [owner, repoName] = repoFullName.split('/');
+                const repoBranches = await getRepoBranches(token, owner, repoName);
+                setBranchesByRepo(prev => ({ ...prev, [repoFullName]: repoBranches }));
+            }}
+          />
+      )}
+
+      {isAiAgentModalOpen && (
+          <AiAgentModal 
+            onClose={() => setAiAgentModalOpen(false)} 
+            onSubmit={handleAiAgentSubmit}
+            agentState={aiAgentState}
+          />
+      )}
+
+      {isBulkEditModalOpen && (
+          <MultiFileAiEditModal
+              fileCount={selectedFilePaths.size}
+              onClose={() => setBulkEditModalOpen(false)}
+              onSubmit={handleBulkAiSubmit}
+          />
+      )}
+
+      {isBulkProgressModalOpen && (
+          <BulkEditProgress
+              jobs={bulkEditJobs}
+              isComplete={!bulkEditJobs.some(j => j.status === 'queued' || j.status === 'processing')}
+              onClose={() => setBulkProgressModalOpen(false)}
+          />
+      )}
+
     </div>
   );
 }

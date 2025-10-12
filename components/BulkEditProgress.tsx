@@ -1,3 +1,4 @@
+
 import React from 'react';
 import { BulkEditJob } from '../types';
 import { Spinner } from './Spinner';
@@ -79,7 +80,7 @@ export const BulkEditProgress: React.FC<BulkEditProgressProps> = ({ jobs, onClos
                        {processingJobs.slice(0, 5).map(job => (
                            <div key={job.id} className="flex-grow flex flex-col min-h-0 bg-gray-850 rounded-lg p-2">
                                <p className="text-blue-300 font-mono text-xs mb-2 truncate" title={job.path}>
-                                 Processing: <span className="font-bold">{job.path.split('/').pop()}</span>
+                                 Processing: <span className="font-bold">{job.path.split('::')[1]}</span>
                                </p>
                                <div className="bg-gray-950 rounded p-2 flex-grow overflow-y-auto">
                                     <pre className="text-xs text-gray-300 whitespace-pre-wrap break-words">

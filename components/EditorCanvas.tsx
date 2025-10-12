@@ -1,7 +1,7 @@
+
 import React, { useState, useEffect, useCallback } from 'react';
 import { SelectedFile, Branch } from '../types';
 import { Spinner } from './Spinner';
-import { AiChatModal } from './AiChatModal';
 import { CommitModal } from './CommitModal';
 import { SparklesIcon } from './icons/SparklesIcon';
 
@@ -9,7 +9,7 @@ interface EditorCanvasProps {
   openFiles: SelectedFile[];
   activeFile: SelectedFile | null;
   onCommit: (commitMessage: string) => Promise<void>;
-  onAiEdit: (currentCode: string, instruction: string, onChunk: (chunk: string) => void) => Promise<void>;
+  onAiEdit: () => void;
   onFileContentChange: (fileKey: string, newContent: string) => void;
   onCloseFile: (fileKey: string) => void;
   onSetActiveFile: (fileKey: string) => void;
@@ -72,12 +72,9 @@ export const EditorCanvas: React.FC<EditorCanvasProps> = ({
   onCreateBranch,
   onCreatePullRequest,
 }) => {
-  const [isAiModalOpen, setIsAiModalOpen] = useState(false);
   const [isCommitModalOpen, setIsCommitModalOpen] = useState(false);
-
   const [newBranchName, setNewBranchName] = useState('');
   const [isCreatingBranch, setIsCreatingBranch] = useState(false);
-
   const [isCreatingPR, setIsCreatingPR] = useState(false);
   const [prTitle, setPrTitle] = useState('');
   const [prBody, setPrBody] = useState('');
@@ -90,32 +87,6 @@ export const EditorCanvas: React.FC<EditorCanvasProps> = ({
   }, [activeFile]);
 
   const hasChanges = activeFile ? activeFile.editedContent !== activeFile.content : false;
-
-  const handleAiSubmit = async (instruction: string) => {
-    if (!instruction.trim() || !activeFile) return;
-
-    const fileKey = activeFile.repoFullName + '::' + activeFile.path;
-    let accumulatedCode = '';
-    
-    // Clear the content for streaming
-    onFileContentChange(fileKey, '');
-
-    const handleChunk = (chunk: string) => {
-      accumulatedCode += chunk;
-      onFileContentChange(fileKey, accumulatedCode);
-    };
-
-    await onAiEdit(activeFile.content, instruction, handleChunk);
-
-    // Final cleanup after streaming is complete
-    const cleanedCode = accumulatedCode.replace(/^```(?:\w*\n)?/, '').replace(/\n?```$/, '').trim();
-    if (cleanedCode) {
-        onFileContentChange(fileKey, cleanedCode);
-    } else {
-        // if AI returns nothing, revert to original edited content
-        onFileContentChange(fileKey, accumulatedCode);
-    }
-  };
 
   const handleCommitSubmit = async (commitMessage: string) => {
     if (!commitMessage.trim() || !activeFile) return;
@@ -224,7 +195,7 @@ export const EditorCanvas: React.FC<EditorCanvasProps> = ({
         ))}
       </div>
 
-      <div className="flex-grow p-4">
+      <div className="flex-grow p-4 overflow-y-auto">
         <textarea
           key={activeFileKey}
           value={activeFile.editedContent}
@@ -235,20 +206,13 @@ export const EditorCanvas: React.FC<EditorCanvasProps> = ({
       </div>
 
       <button
-        onClick={() => setIsAiModalOpen(true)}
+        onClick={onAiEdit}
         className="absolute bottom-6 right-6 bg-indigo-600 text-white rounded-full p-4 shadow-lg hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-4 focus:ring-offset-gray-850 focus:ring-indigo-500 transition-transform hover:scale-110"
         aria-label="Edit with AI"
       >
         <SparklesIcon className="h-6 w-6" />
       </button>
 
-      {isAiModalOpen && (
-        <AiChatModal
-          onClose={() => setIsAiModalOpen(false)}
-          onSubmit={handleAiSubmit}
-          isLoading={isLoading}
-        />
-      )}
       {isCommitModalOpen && (
         <CommitModal
           onClose={() => setIsCommitModalOpen(false)}
